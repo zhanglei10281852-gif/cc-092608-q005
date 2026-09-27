@@ -5,7 +5,15 @@ from typing import Any
 
 from app.core.errors import ValidationError
 from app.core.security import request_fingerprint
-from app.network.types import Allocation, QualityDecision
+from app.network.types import Allocation, Hysteresis, QualityDecision
+
+SEVERITY_RANK = {"minor": 1, "major": 2, "critical": 3}
+
+DEFAULT_HYSTERESIS: dict[str, int] = {
+    "open_after": 1,
+    "recover_after": 3,
+    "cooldown_seconds": 0,
+}
 
 DEFAULT_RULES: dict[str, Any] = {
     "score": {
@@ -24,6 +32,7 @@ DEFAULT_RULES: dict[str, Any] = {
         "max_downlink_mbps": 200.0,
         "max_uplink_mbps": 50.0,
     },
+    "hysteresis": dict(DEFAULT_HYSTERESIS),
 }
 
 
@@ -54,6 +63,41 @@ def validate_rules(rules: dict[str, Any]) -> None:
     duration = allocation.get("duration_seconds")
     if not isinstance(duration, int) or not 30 <= duration <= 3600:
         raise ValidationError("加速时长必须在 30 到 3600 秒之间")
+    hysteresis = rules.get("hysteresis")
+    if hysteresis is not None:
+        if not isinstance(hysteresis, dict):
+            raise ValidationError("迟滞配置必须是对象")
+        _validate_hysteresis_section(hysteresis)
+        overrides = hysteresis.get("app_overrides")
+        if overrides is not None:
+            if not isinstance(overrides, dict):
+                raise ValidationError("迟滞应用覆盖必须是对象")
+            for app_code, override in overrides.items():
+                if not isinstance(app_code, str) or not isinstance(override, dict):
+                    raise ValidationError("迟滞应用覆盖必须按应用编码提供对象")
+                _validate_hysteresis_section(override)
+
+
+def _validate_hysteresis_section(section: dict[str, Any]) -> None:
+    for key, upper in (("open_after", 100), ("recover_after", 100)):
+        value = section.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= upper:
+            raise ValidationError(f"{key} 必须是 1 到 {upper} 之间的整数")
+    cooldown = section.get("cooldown_seconds")
+    if cooldown is not None:
+        if not isinstance(cooldown, int) or isinstance(cooldown, bool) or not 0 <= cooldown <= 86400:
+            raise ValidationError("cooldown_seconds 必须是 0 到 86400 之间的整数")
+
+
+def hysteresis_for(rules: dict[str, Any], app_code: str) -> Hysteresis:
+    section = rules.get("hysteresis") or {}
+    merged = dict(DEFAULT_HYSTERESIS)
+    merged.update({key: value for key, value in section.items() if key != "app_overrides"})
+    override = (section.get("app_overrides") or {}).get(app_code) or {}
+    merged.update(override)
+    return Hysteresis(int(merged["open_after"]), int(merged["recover_after"]), int(merged["cooldown_seconds"]))
 
 
 def judge_quality(sample: dict[str, Any], profile: dict[str, Any], rules: dict[str, Any]) -> QualityDecision:

@@ -10,8 +10,9 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import request_fingerprint
 from app.database import get_connection, transaction
 from app.network.repository import NetworkRepository
-from app.network.rules import DEFAULT_RULES, allocation_for, canonical_rules, judge_quality
+from app.network.rules import DEFAULT_RULES, SEVERITY_RANK, allocation_for, canonical_rules, hysteresis_for, judge_quality
 from app.network.schema import ensure_network_schema
+from app.network.types import Hysteresis, QualityDecision
 
 
 class NetworkAccelerationService:
@@ -144,19 +145,26 @@ class NetworkAccelerationService:
         policy = self.repository.effective_policy(scenario["id"], now)
         rules = json.loads(policy["rules_json"]) if policy else DEFAULT_RULES
         decision = judge_quality(payload, dict(app), rules)
+        hysteresis = hysteresis_for(rules, app["app_code"])
         with transaction(immediate=True) as connection:
             cursor = connection.execute(
                 "INSERT INTO experience_samples(sample_key,scenario_id,segment_id,app_id,subscriber_hash,device_class,train_speed_kmh,latency_ms,packet_loss,downlink_mbps,uplink_mbps,observed_at,received_at,payload_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (payload["sample_key"], scenario["id"], segment["id"] if segment else None, app["id"], payload["subscriber_hash"], payload["device_class"], payload["train_speed_kmh"], payload["latency_ms"], payload["packet_loss"], payload["downlink_mbps"], payload["uplink_mbps"], observed, now, digest),
             )
-            incident_id = None
-            if decision.degraded:
-                incident = connection.execute(
-                    "INSERT INTO quality_incidents(sample_id,scenario_id,segment_id,app_id,severity,reasons_json,opened_at) VALUES(?,?,?,?,?,?,?)",
-                    (cursor.lastrowid, scenario["id"], segment["id"] if segment else None, app["id"], decision.severity, json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True), now),
-                )
-                incident_id = incident.lastrowid
-            return {"sample_id": cursor.lastrowid, "incident_id": incident_id, "quality": decision.as_dict()}
+            incident_id, detection = self._detect(
+                connection,
+                scenario_id=scenario["id"],
+                segment_id=segment["id"] if segment else None,
+                app_id=app["id"],
+                sample_id=cursor.lastrowid,
+                payload=payload,
+                decision=decision,
+                hysteresis=hysteresis,
+                policy=policy,
+                now=now,
+                observed=observed,
+            )
+            return {"sample_id": cursor.lastrowid, "incident_id": incident_id, "quality": decision.as_dict(), "detection": detection}
 
     def ingest_batch(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         results = []
@@ -249,6 +257,16 @@ class NetworkAccelerationService:
         scenario_id = self._scenario(scenario_code)["id"] if scenario_code else None
         return self.repository.open_incidents(scenario_id, limit=limit)
 
+    def get_incident(self, incident_id: int) -> dict[str, Any]:
+        detail = self.repository.incident_detail(incident_id)
+        if detail is None:
+            raise NotFoundError("质差事件不存在")
+        return detail
+
+    def list_detectors(self, scenario_code: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        scenario_id = self._scenario(scenario_code)["id"] if scenario_code else None
+        return self.repository.list_detectors(scenario_id, limit=limit)
+
     def get_session(self, session_id: int) -> dict[str, Any]:
         result = self.repository.session_detail(session_id)
         if result is None:
@@ -275,6 +293,224 @@ class NetworkAccelerationService:
         sample = self.repository.sample_by_id(sample_id)
         incident = self.repository.incident_by_sample(sample_id)
         return {"sample_id": sample_id, "incident_id": incident["id"] if incident else None, "duplicate": True, "sample": dict(sample)}
+
+    def _detect(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        scenario_id: int,
+        segment_id: int | None,
+        app_id: int,
+        sample_id: int,
+        payload: dict[str, Any],
+        decision: QualityDecision,
+        hysteresis: Hysteresis,
+        policy: sqlite3.Row | None,
+        now: str,
+        observed: str,
+    ) -> tuple[int | None, dict[str, Any]]:
+        subscriber = payload["subscriber_hash"]
+        repository = NetworkRepository(connection)
+        detector = repository.detector_by_key(scenario_id, app_id, subscriber)
+        open_streak = int(detector["open_streak"]) if detector else 0
+        recover_streak = int(detector["recover_streak"]) if detector else 0
+        streak_started_at = detector["streak_started_at"] if detector else None
+        active_id = detector["active_incident_id"] if detector else None
+        cooldown_id = detector["cooldown_incident_id"] if detector else None
+        cooldown_until = detector["cooldown_until"] if detector else None
+        active = repository.incident_by_id(active_id) if active_id else None
+        if active is not None and active["state"] not in ("open", "accelerating"):
+            # 加速会话生命周期可能在检测器之外结束了事件，归一化为冷却或清空
+            if active["state"] == "resolved" and hysteresis.cooldown_seconds > 0 and active["resolved_at"]:
+                until = to_storage(from_storage(active["resolved_at"]) + timedelta(seconds=hysteresis.cooldown_seconds))
+                if until >= now:
+                    cooldown_id, cooldown_until = active["id"], until
+            active, active_id = None, None
+        if cooldown_id is not None:
+            cooldown = repository.incident_by_id(cooldown_id)
+            if cooldown_until is None or cooldown_until < now or cooldown is None or cooldown["state"] != "resolved":
+                if cooldown is not None and cooldown["state"] in ("open", "accelerating"):
+                    active, active_id = cooldown, cooldown["id"]
+                cooldown_id, cooldown_until = None, None
+        rule_version = int(policy["version_no"]) if policy else 0
+        policy_version_id = int(policy["id"]) if policy else None
+        incident_id: int | None = None
+        if decision.degraded:
+            recover_streak = 0
+            if active is not None:
+                incident_id = int(active["id"])
+                self._merge_incident(connection, active, decision, payload, observed)
+                open_streak = 0
+                streak_started_at = None
+                action = "merged"
+            elif cooldown_id is not None:
+                incident_id = int(cooldown_id)
+                self._reopen_incident(connection, incident_id, decision, payload, observed)
+                active_id = incident_id
+                cooldown_id, cooldown_until = None, None
+                open_streak = 0
+                streak_started_at = None
+                action = "reopened"
+            else:
+                open_streak += 1
+                if open_streak == 1:
+                    streak_started_at = observed
+                if open_streak >= hysteresis.open_after:
+                    incident_id = self._open_incident(
+                        connection,
+                        sample_id=sample_id,
+                        scenario_id=scenario_id,
+                        segment_id=segment_id,
+                        app_id=app_id,
+                        decision=decision,
+                        payload=payload,
+                        policy_version_id=policy_version_id,
+                        rule_version=rule_version,
+                        now=now,
+                        observed=observed,
+                        streak_started_at=streak_started_at,
+                        streak=open_streak,
+                    )
+                    active_id = incident_id
+                    open_streak = 0
+                    streak_started_at = None
+                    action = "opened"
+                else:
+                    action = "tracking"
+        else:
+            open_streak = 0
+            streak_started_at = None
+            if active is not None and active["state"] == "open":
+                incident_id = int(active["id"])
+                recover_streak += 1
+                if recover_streak >= hysteresis.recover_after:
+                    self._resolve_incident(connection, active, now, observed)
+                    recover_streak = 0
+                    active_id = None
+                    if hysteresis.cooldown_seconds > 0:
+                        cooldown_id = incident_id
+                        cooldown_until = to_storage(from_storage(now) + timedelta(seconds=hysteresis.cooldown_seconds))
+                    action = "recovered"
+                else:
+                    self._attribute_incident(connection, active, observed)
+                    action = "recovering"
+            else:
+                action = "clear"
+        sample_total = (int(detector["sample_count"]) if detector else 0) + 1
+        first_observed = min(detector["first_observed_at"], observed) if detector and detector["first_observed_at"] else observed
+        last_observed = max(detector["last_observed_at"], observed) if detector and detector["last_observed_at"] else observed
+        if detector is None:
+            connection.execute(
+                "INSERT INTO incident_detectors(scenario_id,app_id,subscriber_hash,open_streak,recover_streak,streak_started_at,active_incident_id,cooldown_incident_id,cooldown_until,rule_version,sample_count,first_observed_at,last_observed_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (scenario_id, app_id, subscriber, open_streak, recover_streak, streak_started_at, active_id, cooldown_id, cooldown_until, rule_version, sample_total, first_observed, last_observed, now),
+            )
+        else:
+            connection.execute(
+                "UPDATE incident_detectors SET open_streak=?,recover_streak=?,streak_started_at=?,active_incident_id=?,cooldown_incident_id=?,cooldown_until=?,rule_version=?,sample_count=?,first_observed_at=?,last_observed_at=?,updated_at=? WHERE id=?",
+                (open_streak, recover_streak, streak_started_at, active_id, cooldown_id, cooldown_until, rule_version, sample_total, first_observed, last_observed, now, detector["id"]),
+            )
+        detection = {
+            "action": action,
+            "open_streak": open_streak,
+            "recover_streak": recover_streak,
+            "cooldown_until": cooldown_until,
+            "rule_version": rule_version,
+        }
+        return incident_id, detection
+
+    @staticmethod
+    def _open_incident(
+        connection: sqlite3.Connection,
+        *,
+        sample_id: int,
+        scenario_id: int,
+        segment_id: int | None,
+        app_id: int,
+        decision: QualityDecision,
+        payload: dict[str, Any],
+        policy_version_id: int | None,
+        rule_version: int,
+        now: str,
+        observed: str,
+        streak_started_at: str | None,
+        streak: int,
+    ) -> int:
+        cursor = connection.execute(
+            "INSERT INTO quality_incidents(sample_id,scenario_id,segment_id,app_id,severity,reasons_json,opened_at,policy_version_id,rule_version,sample_count,worst_score,worst_latency_ms,worst_packet_loss,worst_downlink_mbps,worst_uplink_mbps,first_observed_at,last_observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                sample_id,
+                scenario_id,
+                segment_id,
+                app_id,
+                decision.severity,
+                json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True),
+                now,
+                policy_version_id,
+                rule_version,
+                streak,
+                decision.score,
+                payload["latency_ms"],
+                payload["packet_loss"],
+                payload["downlink_mbps"],
+                payload["uplink_mbps"],
+                streak_started_at or observed,
+                observed,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    @classmethod
+    def _merge_incident(cls, connection: sqlite3.Connection, incident: sqlite3.Row, decision: QualityDecision, payload: dict[str, Any], observed: str, *, reopen: bool = False) -> None:
+        previous_worst = float(incident["worst_score"] or 0.0)
+        severity = decision.severity if SEVERITY_RANK[decision.severity] > SEVERITY_RANK[incident["severity"]] else incident["severity"]
+        reasons = json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True) if decision.score > previous_worst else incident["reasons_json"]
+        state = ",state='open',resolved_at=NULL" if reopen else ""
+        connection.execute(
+            "UPDATE quality_incidents SET severity=?,reasons_json=?,sample_count=sample_count+1,worst_score=?,"
+            "worst_latency_ms=?,worst_packet_loss=?,worst_downlink_mbps=?,worst_uplink_mbps=?,"
+            "first_observed_at=?,last_observed_at=?,version=version+1" + state + " WHERE id=?",
+            (
+                severity,
+                reasons,
+                max(previous_worst, decision.score),
+                cls._worst_high(incident["worst_latency_ms"], payload["latency_ms"]),
+                cls._worst_high(incident["worst_packet_loss"], payload["packet_loss"]),
+                cls._worst_low(incident["worst_downlink_mbps"], payload["downlink_mbps"]),
+                cls._worst_low(incident["worst_uplink_mbps"], payload["uplink_mbps"]),
+                min(incident["first_observed_at"], observed) if incident["first_observed_at"] else observed,
+                max(incident["last_observed_at"], observed) if incident["last_observed_at"] else observed,
+                incident["id"],
+            ),
+        )
+
+    @classmethod
+    def _reopen_incident(cls, connection: sqlite3.Connection, incident_id: int, decision: QualityDecision, payload: dict[str, Any], observed: str) -> None:
+        incident = NetworkRepository(connection).incident_by_id(incident_id)
+        cls._merge_incident(connection, incident, decision, payload, observed, reopen=True)
+
+    @staticmethod
+    def _resolve_incident(connection: sqlite3.Connection, incident: sqlite3.Row, now: str, observed: str) -> None:
+        last = max(incident["last_observed_at"], observed) if incident["last_observed_at"] else observed
+        connection.execute(
+            "UPDATE quality_incidents SET state='resolved',resolved_at=?,sample_count=sample_count+1,last_observed_at=?,version=version+1 WHERE id=?",
+            (now, last, incident["id"]),
+        )
+
+    @staticmethod
+    def _attribute_incident(connection: sqlite3.Connection, incident: sqlite3.Row, observed: str) -> None:
+        last = max(incident["last_observed_at"], observed) if incident["last_observed_at"] else observed
+        connection.execute(
+            "UPDATE quality_incidents SET sample_count=sample_count+1,last_observed_at=?,version=version+1 WHERE id=?",
+            (last, incident["id"]),
+        )
+
+    @staticmethod
+    def _worst_high(stored: float | None, current: float) -> float:
+        return max(float(stored), float(current)) if stored is not None else float(current)
+
+    @staticmethod
+    def _worst_low(stored: float | None, current: float) -> float:
+        return min(float(stored), float(current)) if stored is not None else float(current)
 
     def _scenario(self, code: str) -> sqlite3.Row:
         row = self.repository.scenario_by_code(code)

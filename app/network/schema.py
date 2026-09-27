@@ -89,9 +89,38 @@ CREATE TABLE IF NOT EXISTS quality_incidents (
     state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','accelerating','resolved','expired')),
     opened_at TEXT NOT NULL,
     resolved_at TEXT,
+    policy_version_id INTEGER REFERENCES policy_versions(id),
+    rule_version INTEGER NOT NULL DEFAULT 0,
+    sample_count INTEGER NOT NULL DEFAULT 1,
+    worst_score REAL NOT NULL DEFAULT 0,
+    worst_latency_ms REAL,
+    worst_packet_loss REAL,
+    worst_downlink_mbps REAL,
+    worst_uplink_mbps REAL,
+    first_observed_at TEXT,
+    last_observed_at TEXT,
     version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_open ON quality_incidents(state,severity,opened_at);
+CREATE TABLE IF NOT EXISTS incident_detectors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id) ON DELETE CASCADE,
+    app_id INTEGER NOT NULL REFERENCES application_profiles(id) ON DELETE CASCADE,
+    subscriber_hash TEXT NOT NULL,
+    open_streak INTEGER NOT NULL DEFAULT 0,
+    recover_streak INTEGER NOT NULL DEFAULT 0,
+    streak_started_at TEXT,
+    active_incident_id INTEGER REFERENCES quality_incidents(id),
+    cooldown_incident_id INTEGER REFERENCES quality_incidents(id),
+    cooldown_until TEXT,
+    rule_version INTEGER NOT NULL DEFAULT 0,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    first_observed_at TEXT,
+    last_observed_at TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(scenario_id, app_id, subscriber_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_detectors_incident ON incident_detectors(active_incident_id);
 CREATE TABLE IF NOT EXISTS acceleration_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id INTEGER NOT NULL REFERENCES quality_incidents(id),
@@ -201,6 +230,23 @@ CREATE TABLE IF NOT EXISTS operation_events (
 CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(resource_type,resource_id,id);
 '''
 
+INCIDENT_EVOLUTION_COLUMNS = (
+    ("policy_version_id", "INTEGER REFERENCES policy_versions(id)"),
+    ("rule_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("sample_count", "INTEGER NOT NULL DEFAULT 1"),
+    ("worst_score", "REAL NOT NULL DEFAULT 0"),
+    ("worst_latency_ms", "REAL"),
+    ("worst_packet_loss", "REAL"),
+    ("worst_downlink_mbps", "REAL"),
+    ("worst_uplink_mbps", "REAL"),
+    ("first_observed_at", "TEXT"),
+    ("last_observed_at", "TEXT"),
+)
+
 
 def ensure_network_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(NETWORK_SCHEMA)
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(quality_incidents)").fetchall()}
+    for name, definition in INCIDENT_EVOLUTION_COLUMNS:
+        if name not in existing:
+            connection.execute(f"ALTER TABLE quality_incidents ADD COLUMN {name} {definition}")

@@ -107,6 +107,26 @@ class NetworkRepository:
     def incident_by_id(self, incident_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM quality_incidents WHERE id=?", (incident_id,)).fetchone()
 
+    def incident_detail(self, incident_id: int) -> dict[str, Any] | None:
+        row = self.incident_by_id(incident_id)
+        return self._incident(row) if row is not None else None
+
+    def detector_by_key(self, scenario_id: int, app_id: int, subscriber_hash: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM incident_detectors WHERE scenario_id=? AND app_id=? AND subscriber_hash=?",
+            (scenario_id, app_id, subscriber_hash),
+        ).fetchone()
+
+    def list_detectors(self, scenario_id: int | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM incident_detectors"
+        params: list[Any] = []
+        if scenario_id is not None:
+            sql += " WHERE scenario_id=?"
+            params.append(scenario_id)
+        sql += " ORDER BY id LIMIT ?"
+        params.append(limit)
+        return rows_dict(self.connection.execute(sql, params).fetchall())
+
     def open_incidents(self, scenario_id: int | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
         sql = "SELECT * FROM quality_incidents WHERE state IN ('open','accelerating')"
         params: list[Any] = []

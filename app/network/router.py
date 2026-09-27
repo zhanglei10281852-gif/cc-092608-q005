@@ -69,6 +69,16 @@ def open_incidents(scenario_code: str | None = None, limit: int = Query(default=
     return {"items": service().open_incidents(scenario_code, limit)}
 
 
+@router.get("/incidents/{incident_id}")
+def get_incident(incident_id: int):
+    return service().get_incident(incident_id)
+
+
+@router.get("/detectors")
+def list_detectors(scenario_code: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": service().list_detectors(scenario_code, limit)}
+
+
 @router.post("/incidents/{incident_id}/accelerate")
 def start_acceleration(incident_id: int, payload: AccelerationStart):
     return service().start_acceleration(incident_id, payload.actor)

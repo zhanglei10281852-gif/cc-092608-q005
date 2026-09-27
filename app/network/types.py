@@ -30,6 +30,13 @@ class Allocation:
 
 
 @dataclass(frozen=True, slots=True)
+class Hysteresis:
+    open_after: int
+    recover_after: int
+    cooldown_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveWindow:
     starts_at: datetime
     ends_at: datetime
