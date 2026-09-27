@@ -101,14 +101,93 @@ class NetworkRepository:
     def sample_by_id(self, sample_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM experience_samples WHERE id=?", (sample_id,)).fetchone()
 
-    def incident_by_sample(self, sample_id: int) -> sqlite3.Row | None:
-        return self.connection.execute("SELECT * FROM quality_incidents WHERE sample_id=?", (sample_id,)).fetchone()
-
     def incident_by_id(self, incident_id: int) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM quality_incidents WHERE id=?", (incident_id,)).fetchone()
 
+    def incident_detail(self, incident_id: int) -> dict[str, Any] | None:
+        row = self.incident_by_id(incident_id)
+        if row is None:
+            return None
+        result = self._incident(row)
+        result["links"] = self.incident_samples(incident_id)
+        return result
+
+    def incident_samples(self, incident_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT l.sample_id,l.link_role,l.degraded,l.score,l.observed_at,x.latency_ms,x.packet_loss,x.downlink_mbps,x.uplink_mbps "
+            "FROM incident_samples l JOIN experience_samples x ON x.id=l.sample_id "
+            "WHERE l.incident_id=? ORDER BY x.observed_at,l.sample_id",
+            (incident_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def track_by_key(self, scenario_id: int, segment_id: int | None, app_id: int, subscriber_hash: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM quality_tracks WHERE scenario_id=? AND segment_id IS ? AND app_id=? AND subscriber_hash=?",
+            (scenario_id, segment_id, app_id, subscriber_hash),
+        ).fetchone()
+
+    def track_by_incident(self, incident_id: int) -> sqlite3.Row | None:
+        return self.connection.execute("SELECT * FROM quality_tracks WHERE incident_id=?", (incident_id,)).fetchone()
+
+    def list_tracks(
+        self,
+        *,
+        scenario_id: int | None = None,
+        app_id: int | None = None,
+        subscriber_hash: str | None = None,
+        active_only: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM quality_tracks"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if active_only:
+            clauses.append("phase IN ('pending','open','cooling')")
+        if scenario_id is not None:
+            clauses.append("scenario_id=?")
+            params.append(scenario_id)
+        if app_id is not None:
+            clauses.append("app_id=?")
+            params.append(app_id)
+        if subscriber_hash:
+            clauses.append("subscriber_hash=?")
+            params.append(subscriber_hash)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY last_observed_at DESC,id DESC LIMIT ?"
+        params.append(limit)
+        rows = self.connection.execute(sql, params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["hysteresis"] = json.loads(item.pop("hysteresis_json"))
+            result.append(item)
+        return result
+
+    def upsert_track(self, fields: dict[str, Any]) -> None:
+        self.connection.execute(
+            "INSERT INTO quality_tracks(track_key,scenario_id,segment_id,app_id,subscriber_hash,incident_id,phase,"
+            "degrade_streak,healthy_streak,peak_severity,worst_score,sample_count,cooldown_until,staging_json,"
+            "first_observed_at,last_observed_at,policy_version_id,policy_version_no,rules_digest,hysteresis_json,"
+            "created_at,updated_at) "
+            "VALUES(:track_key,:scenario_id,:segment_id,:app_id,:subscriber_hash,:incident_id,:phase,"
+            ":degrade_streak,:healthy_streak,:peak_severity,:worst_score,:sample_count,:cooldown_until,:staging_json,"
+            ":first_observed_at,:last_observed_at,:policy_version_id,:policy_version_no,:rules_digest,:hysteresis_json,"
+            ":now,:now) "
+            "ON CONFLICT(track_key) DO UPDATE SET incident_id=:incident_id,phase=:phase,degrade_streak=:degrade_streak,"
+            "healthy_streak=:healthy_streak,peak_severity=:peak_severity,worst_score=:worst_score,"
+            "sample_count=:sample_count,cooldown_until=:cooldown_until,staging_json=:staging_json,"
+            "last_observed_at=:last_observed_at,policy_version_id=:policy_version_id,policy_version_no=:policy_version_no,"
+            "rules_digest=:rules_digest,hysteresis_json=:hysteresis_json,updated_at=:now",
+            fields,
+        )
+
+    def delete_track(self, track_id: int) -> None:
+        self.connection.execute("DELETE FROM quality_tracks WHERE id=?", (track_id,))
+
     def open_incidents(self, scenario_id: int | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM quality_incidents WHERE state IN ('open','accelerating')"
+        sql = "SELECT * FROM quality_incidents WHERE state IN ('open','cooling','accelerating')"
         params: list[Any] = []
         if scenario_id is not None:
             sql += " AND scenario_id=?"
@@ -182,4 +261,7 @@ class NetworkRepository:
     def _incident(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["reasons"] = json.loads(result.pop("reasons_json"))
+        if "hysteresis_json" in result:
+            raw = result.pop("hysteresis_json")
+            result["hysteresis"] = json.loads(raw) if raw else {}
         return result

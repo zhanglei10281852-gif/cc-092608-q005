@@ -80,18 +80,68 @@ CREATE TABLE IF NOT EXISTS experience_samples (
 CREATE INDEX IF NOT EXISTS idx_samples_scene_time ON experience_samples(scenario_id,observed_at);
 CREATE TABLE IF NOT EXISTS quality_incidents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sample_id INTEGER NOT NULL UNIQUE REFERENCES experience_samples(id) ON DELETE CASCADE,
+    sample_id INTEGER NOT NULL REFERENCES experience_samples(id) ON DELETE CASCADE,
     scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
     segment_id INTEGER REFERENCES network_segments(id),
     app_id INTEGER NOT NULL REFERENCES application_profiles(id),
+    subscriber_hash TEXT NOT NULL DEFAULT '',
     severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
-    reasons_json TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','accelerating','resolved','expired')),
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','accelerating','cooling','resolved','expired')),
+    policy_version_id INTEGER REFERENCES policy_versions(id),
+    policy_version_no INTEGER,
+    rules_digest TEXT NOT NULL DEFAULT '',
+    hysteresis_json TEXT NOT NULL DEFAULT '{}',
+    sample_count INTEGER NOT NULL DEFAULT 1 CHECK(sample_count >= 1),
+    worst_score REAL NOT NULL DEFAULT 0,
+    worst_sample_id INTEGER REFERENCES experience_samples(id),
     opened_at TEXT NOT NULL,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    recovered_at TEXT,
+    closed_at TEXT,
     resolved_at TEXT,
     version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_open ON quality_incidents(state,severity,opened_at);
+-- idx_incidents_lifecycle 依赖迁移后的新列，在 ensure_network_schema 末尾创建。
+CREATE TABLE IF NOT EXISTS incident_samples (
+    incident_id INTEGER NOT NULL REFERENCES quality_incidents(id) ON DELETE CASCADE,
+    sample_id INTEGER NOT NULL UNIQUE REFERENCES experience_samples(id) ON DELETE CASCADE,
+    link_role TEXT NOT NULL DEFAULT 'attached' CHECK(link_role IN ('trigger','attached')),
+    degraded INTEGER NOT NULL DEFAULT 1 CHECK(degraded IN (0,1)),
+    score REAL NOT NULL DEFAULT 0,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(incident_id, sample_id)
+);
+CREATE INDEX IF NOT EXISTS idx_incident_samples_sample ON incident_samples(sample_id);
+CREATE TABLE IF NOT EXISTS quality_tracks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_key TEXT NOT NULL UNIQUE,
+    scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
+    segment_id INTEGER REFERENCES network_segments(id),
+    app_id INTEGER NOT NULL REFERENCES application_profiles(id),
+    subscriber_hash TEXT NOT NULL,
+    incident_id INTEGER REFERENCES quality_incidents(id) ON DELETE SET NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('pending','open','cooling')),
+    degrade_streak INTEGER NOT NULL DEFAULT 0 CHECK(degrade_streak >= 0),
+    healthy_streak INTEGER NOT NULL DEFAULT 0 CHECK(healthy_streak >= 0),
+    peak_severity TEXT CHECK(peak_severity IN ('minor','major','critical')),
+    worst_score REAL NOT NULL DEFAULT 0,
+    sample_count INTEGER NOT NULL DEFAULT 0 CHECK(sample_count >= 0),
+    cooldown_until TEXT,
+    staging_json TEXT NOT NULL DEFAULT '[]',
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    policy_version_id INTEGER REFERENCES policy_versions(id),
+    policy_version_no INTEGER,
+    rules_digest TEXT NOT NULL DEFAULT '',
+    hysteresis_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tracks_active ON quality_tracks(phase,cooldown_until);
+CREATE INDEX IF NOT EXISTS idx_tracks_incident ON quality_tracks(incident_id);
 CREATE TABLE IF NOT EXISTS acceleration_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id INTEGER NOT NULL REFERENCES quality_incidents(id),
@@ -203,4 +253,79 @@ CREATE INDEX IF NOT EXISTS idx_operation_events_resource ON operation_events(res
 
 
 def ensure_network_schema(connection: sqlite3.Connection) -> None:
+    # 先建全部新表；旧库中已存在的 quality_incidents（旧形态）会被 IF NOT EXISTS 跳过。
     connection.executescript(NETWORK_SCHEMA)
+    _migrate_quality_incidents(connection)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_incidents_lifecycle "
+        "ON quality_incidents(scenario_id,app_id,subscriber_hash,state,last_observed_at)"
+    )
+
+
+def _migrate_quality_incidents(connection: sqlite3.Connection) -> None:
+    """旧库中 quality_incidents.sample_id 带有 UNIQUE 约束，无法承载事件聚合，检测到旧形态则重建。"""
+    existing = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='quality_incidents'"
+    ).fetchone()
+    if existing is None:
+        return
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(quality_incidents)")}
+    if "sample_count" in columns:
+        return
+    # 重建父表期间关闭外键（必须在事务外执行），完成后立即恢复。
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE quality_incidents_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sample_id INTEGER NOT NULL REFERENCES experience_samples(id) ON DELETE CASCADE,
+                scenario_id INTEGER NOT NULL REFERENCES network_scenarios(id),
+                segment_id INTEGER REFERENCES network_segments(id),
+                app_id INTEGER NOT NULL REFERENCES application_profiles(id),
+                subscriber_hash TEXT NOT NULL DEFAULT '',
+                severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','accelerating','cooling','resolved','expired')),
+                policy_version_id INTEGER REFERENCES policy_versions(id),
+                policy_version_no INTEGER,
+                rules_digest TEXT NOT NULL DEFAULT '',
+                hysteresis_json TEXT NOT NULL DEFAULT '{}',
+                sample_count INTEGER NOT NULL DEFAULT 1 CHECK(sample_count >= 1),
+                worst_score REAL NOT NULL DEFAULT 0,
+                worst_sample_id INTEGER REFERENCES experience_samples(id),
+                opened_at TEXT NOT NULL,
+                first_observed_at TEXT NOT NULL,
+                last_observed_at TEXT NOT NULL,
+                recovered_at TEXT,
+                closed_at TEXT,
+                resolved_at TEXT,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+            INSERT INTO quality_incidents_new
+                (id,sample_id,scenario_id,segment_id,app_id,subscriber_hash,severity,reasons_json,state,
+                 opened_at,first_observed_at,last_observed_at,resolved_at,version,worst_sample_id)
+            SELECT i.id,i.sample_id,i.scenario_id,i.segment_id,i.app_id,x.subscriber_hash,i.severity,i.reasons_json,i.state,
+                   i.opened_at,x.observed_at,x.observed_at,i.resolved_at,i.version,i.sample_id
+            FROM quality_incidents i JOIN experience_samples x ON x.id=i.sample_id;
+            DROP TABLE quality_incidents;
+            ALTER TABLE quality_incidents_new RENAME TO quality_incidents;
+            """
+        )
+        # incident_samples 已由 NETWORK_SCHEMA 建立，回填旧事件的触发样本关联。
+        connection.execute(
+            "INSERT OR IGNORE INTO incident_samples(incident_id,sample_id,link_role,score,observed_at) "
+            "SELECT i.id,i.sample_id,'trigger',0,x.observed_at "
+            "FROM quality_incidents i JOIN experience_samples x ON x.id=i.sample_id"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_incidents_open ON quality_incidents(state,severity,opened_at)"
+        )
+        if foreign_keys:
+            violation = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violation:
+                raise RuntimeError(f"迁移后存在外键违例: {violation[:5]}")
+    finally:
+        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
+

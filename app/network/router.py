@@ -69,6 +69,22 @@ def open_incidents(scenario_code: str | None = None, limit: int = Query(default=
     return {"items": service().open_incidents(scenario_code, limit)}
 
 
+@router.get("/incidents/{incident_id}")
+def get_incident(incident_id: int):
+    return service().get_incident(incident_id)
+
+
+@router.get("/hysteresis/tracks")
+def hysteresis_tracks(
+    scenario_code: str | None = None,
+    app_code: str | None = None,
+    subscriber_hash: str | None = Query(default=None, min_length=16, max_length=128),
+    include_closed: bool = False,
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    return {"items": service().list_hysteresis_tracks(scenario_code, app_code, subscriber_hash, include_closed, limit)}
+
+
 @router.post("/incidents/{incident_id}/accelerate")
 def start_acceleration(incident_id: int, payload: AccelerationStart):
     return service().start_acceleration(incident_id, payload.actor)

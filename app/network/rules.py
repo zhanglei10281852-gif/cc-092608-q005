@@ -5,6 +5,7 @@ from typing import Any
 
 from app.core.errors import ValidationError
 from app.core.security import request_fingerprint
+from app.network.hysteresis import DEFAULT_HYSTERESIS, validate_hysteresis
 from app.network.types import Allocation, QualityDecision
 
 DEFAULT_RULES: dict[str, Any] = {
@@ -24,6 +25,7 @@ DEFAULT_RULES: dict[str, Any] = {
         "max_downlink_mbps": 200.0,
         "max_uplink_mbps": 50.0,
     },
+    "hysteresis": DEFAULT_HYSTERESIS,
 }
 
 
@@ -54,6 +56,7 @@ def validate_rules(rules: dict[str, Any]) -> None:
     duration = allocation.get("duration_seconds")
     if not isinstance(duration, int) or not 30 <= duration <= 3600:
         raise ValidationError("加速时长必须在 30 到 3600 秒之间")
+    validate_hysteresis(rules.get("hysteresis", DEFAULT_HYSTERESIS))
 
 
 def judge_quality(sample: dict[str, Any], profile: dict[str, Any], rules: dict[str, Any]) -> QualityDecision:

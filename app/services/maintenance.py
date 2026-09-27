@@ -32,7 +32,8 @@ class MaintenanceService:
         "departments", "users", "roles", "permissions", "role_permissions", "user_roles",
         "department_memberships", "audit_events", "background_jobs", "network_scenarios",
         "network_segments", "application_profiles", "policy_versions", "experience_samples",
-        "quality_incidents", "acceleration_sessions", "capacity_reservations", "session_events",
+        "quality_incidents", "incident_samples", "quality_tracks",
+        "acceleration_sessions", "capacity_reservations", "session_events",
         "subscriber_entitlements",
     )
 

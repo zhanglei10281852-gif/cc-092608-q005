@@ -34,19 +34,22 @@ class NetworkAnalytics:
         clauses, params = window.clauses("s.observed_at")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         row = self.connection.execute(
-            "SELECT COUNT(*) AS samples,COUNT(i.id) AS incidents,"
+            "SELECT COUNT(*) AS samples,COUNT(DISTINCT i.id) AS incidents,"
+            "COALESCE(SUM(CASE WHEN l.degraded=1 THEN 1 ELSE 0 END),0) AS linked_samples,"
             "COALESCE(AVG(s.latency_ms),0) AS average_latency_ms,"
             "COALESCE(AVG(s.packet_loss),0) AS average_packet_loss,"
             "COALESCE(AVG(s.downlink_mbps),0) AS average_downlink_mbps "
-            "FROM experience_samples s LEFT JOIN quality_incidents i ON i.sample_id=s.id" + where,
+            "FROM experience_samples s "
+            "LEFT JOIN incident_samples l ON l.sample_id=s.id "
+            "LEFT JOIN quality_incidents i ON i.id=l.incident_id" + where,
             params,
         ).fetchone()
         samples = int(row["samples"])
-        incidents = int(row["incidents"])
+        linked = int(row["linked_samples"])
         return {
             "samples": samples,
-            "incidents": incidents,
-            "degraded_ratio": round(incidents / samples, 6) if samples else 0.0,
+            "incidents": int(row["incidents"]),
+            "degraded_ratio": round(linked / samples, 6) if samples else 0.0,
             "average_latency_ms": round(float(row["average_latency_ms"]), 3),
             "average_packet_loss": round(float(row["average_packet_loss"]), 6),
             "average_downlink_mbps": round(float(row["average_downlink_mbps"]), 3),
@@ -57,24 +60,26 @@ class NetworkAnalytics:
         clauses, params = window.clauses("s.observed_at")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self.connection.execute(
-            "SELECT n.code,n.name,n.scene_type,COUNT(s.id) AS samples,COUNT(i.id) AS incidents,"
+            "SELECT n.code,n.name,n.scene_type,COUNT(s.id) AS samples,COUNT(DISTINCT i.id) AS incidents,"
+            "SUM(CASE WHEN l.degraded=1 THEN 1 ELSE 0 END) AS linked_samples,"
             "COALESCE(AVG(s.latency_ms),0) AS average_latency_ms,"
             "COALESCE(AVG(s.downlink_mbps),0) AS average_downlink_mbps "
             "FROM network_scenarios n LEFT JOIN experience_samples s ON s.scenario_id=n.id "
-            "LEFT JOIN quality_incidents i ON i.sample_id=s.id" + where + " GROUP BY n.id ORDER BY incidents DESC,n.code",
+            "LEFT JOIN incident_samples l ON l.sample_id=s.id "
+            "LEFT JOIN quality_incidents i ON i.id=l.incident_id" + where + " GROUP BY n.id ORDER BY incidents DESC,n.code",
             params,
         ).fetchall()
         result = []
         for row in rows:
             samples = int(row["samples"])
-            incidents = int(row["incidents"])
+            linked = int(row["linked_samples"])
             result.append({
                 "scenario_code": row["code"],
                 "scenario_name": row["name"],
                 "scene_type": row["scene_type"],
                 "samples": samples,
-                "incidents": incidents,
-                "degraded_ratio": round(incidents / samples, 6) if samples else 0.0,
+                "incidents": int(row["incidents"]),
+                "degraded_ratio": round(linked / samples, 6) if samples else 0.0,
                 "average_latency_ms": round(float(row["average_latency_ms"]), 3),
                 "average_downlink_mbps": round(float(row["average_downlink_mbps"]), 3),
             })
@@ -85,24 +90,26 @@ class NetworkAnalytics:
         clauses, params = window.clauses("s.observed_at")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self.connection.execute(
-            "SELECT a.app_code,a.name,a.category,COUNT(s.id) AS samples,COUNT(i.id) AS incidents,"
+            "SELECT a.app_code,a.name,a.category,COUNT(s.id) AS samples,COUNT(DISTINCT i.id) AS incidents,"
+            "SUM(CASE WHEN l.degraded=1 THEN 1 ELSE 0 END) AS linked_samples,"
             "COALESCE(AVG(s.latency_ms),0) AS average_latency_ms,"
             "COALESCE(AVG(s.packet_loss),0) AS average_packet_loss "
             "FROM application_profiles a LEFT JOIN experience_samples s ON s.app_id=a.id "
-            "LEFT JOIN quality_incidents i ON i.sample_id=s.id" + where + " GROUP BY a.id ORDER BY incidents DESC,a.app_code",
+            "LEFT JOIN incident_samples l ON l.sample_id=s.id "
+            "LEFT JOIN quality_incidents i ON i.id=l.incident_id" + where + " GROUP BY a.id ORDER BY incidents DESC,a.app_code",
             params,
         ).fetchall()
         result = []
         for row in rows:
             samples = int(row["samples"])
-            incidents = int(row["incidents"])
+            linked = int(row["linked_samples"])
             result.append({
                 "app_code": row["app_code"],
                 "app_name": row["name"],
                 "category": row["category"],
                 "samples": samples,
-                "incidents": incidents,
-                "degraded_ratio": round(incidents / samples, 6) if samples else 0.0,
+                "incidents": int(row["incidents"]),
+                "degraded_ratio": round(linked / samples, 6) if samples else 0.0,
                 "average_latency_ms": round(float(row["average_latency_ms"]), 3),
                 "average_packet_loss": round(float(row["average_packet_loss"]), 6),
             })
@@ -117,28 +124,29 @@ class NetworkAnalytics:
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         rows = self.connection.execute(
             "SELECT n.code AS scenario_code,n.name AS scenario_name,g.code AS segment_code,g.name AS segment_name,"
-            "COUNT(x.id) AS samples,COUNT(i.id) AS incidents,"
+            "COUNT(x.id) AS samples,COUNT(DISTINCT i.id) AS incidents,SUM(CASE WHEN l.degraded=1 THEN 1 ELSE 0 END) AS linked_samples,"
             "COALESCE(AVG(x.latency_ms),0) AS average_latency_ms,"
             "COALESCE(AVG(x.packet_loss),0) AS average_packet_loss,"
             "COALESCE(AVG(x.downlink_mbps),0) AS average_downlink_mbps "
             "FROM network_segments g JOIN network_scenarios n ON n.id=g.scenario_id "
             "LEFT JOIN experience_samples x ON x.segment_id=g.id "
-            "LEFT JOIN quality_incidents i ON i.sample_id=x.id" + where +
+            "LEFT JOIN incident_samples l ON l.sample_id=x.id "
+            "LEFT JOIN quality_incidents i ON i.id=l.incident_id" + where +
             " GROUP BY g.id ORDER BY incidents DESC,n.code,g.sequence_no,g.id",
             params,
         ).fetchall()
         result = []
         for row in rows:
             samples = int(row["samples"])
-            incidents = int(row["incidents"])
+            linked = int(row["linked_samples"])
             result.append({
                 "scenario_code": row["scenario_code"],
                 "scenario_name": row["scenario_name"],
                 "segment_code": row["segment_code"],
                 "segment_name": row["segment_name"],
                 "samples": samples,
-                "incidents": incidents,
-                "degraded_ratio": round(incidents / samples, 6) if samples else 0.0,
+                "incidents": int(row["incidents"]),
+                "degraded_ratio": round(linked / samples, 6) if samples else 0.0,
                 "average_latency_ms": round(float(row["average_latency_ms"]), 3),
                 "average_packet_loss": round(float(row["average_packet_loss"]), 6),
                 "average_downlink_mbps": round(float(row["average_downlink_mbps"]), 3),
@@ -188,7 +196,7 @@ class NetworkAnalytics:
             "LEFT JOIN network_segments g ON g.id=i.segment_id "
             "JOIN application_profiles a ON a.id=i.app_id "
             "JOIN experience_samples x ON x.id=i.sample_id "
-            "WHERE i.state IN ('open','accelerating') AND i.opened_at<? "
+            "WHERE i.state IN ('open','cooling','accelerating') AND i.opened_at<? "
             "ORDER BY CASE i.severity WHEN 'critical' THEN 3 WHEN 'major' THEN 2 ELSE 1 END DESC,i.opened_at,i.id LIMIT ?",
             (before, limit),
         ).fetchall()

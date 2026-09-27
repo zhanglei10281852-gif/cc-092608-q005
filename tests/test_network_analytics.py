@@ -76,8 +76,8 @@ def test_report_window_and_event_cursor(client):
     )
     sample_id = connection.execute("SELECT id FROM experience_samples WHERE sample_key='analytics-manual'").fetchone()[0]
     connection.execute(
-        "INSERT INTO quality_incidents(sample_id,scenario_id,segment_id,app_id,severity,reasons_json,opened_at) VALUES(?,?,?,?, 'major','{}','2026-09-26T02:00:00Z')",
-        (sample_id, scenario, segment, app),
+        "INSERT INTO quality_incidents(sample_id,scenario_id,segment_id,app_id,subscriber_hash,severity,reasons_json,opened_at,first_observed_at,last_observed_at) VALUES(?,?,?,?,?, 'major','{}','2026-09-26T02:00:00Z','2026-09-26T02:00:00Z','2026-09-26T02:00:00Z')",
+        (sample_id, scenario, segment, app, "subscriber-analytics-0003"),
     )
     incident = connection.execute("SELECT id FROM quality_incidents WHERE sample_id=?", (sample_id,)).fetchone()[0]
     connection.execute(
